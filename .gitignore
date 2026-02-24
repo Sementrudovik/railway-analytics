@@ -1,0 +1,56 @@
+# Виртуальное окружение
+venv/
+.env/
+.venv/
+ENV/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+pip-log.txt
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Данные
+data/raw/*
+data/processed/*
+!data/samples/
+*.xlsb
+*.xlsx
+*.csv
+*.parquet
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints/
+
+# Логи
+*.log
+logs/
+
+# Environment
+.env
+.env.local
+.env.production
+
+# Системные
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Docker
+docker-compose.override.yml
