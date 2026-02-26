@@ -22,7 +22,7 @@ def read_xlsb_sample(file_path: str, n_rows: int = 100) -> pd.DataFrame:
         with wb.get_sheet(1) as sheet:
             for i, row in enumerate(sheet.rows()):
                 if i == 0:
-                    headers = [item.v for item in row]
+                     headers = [item.v for item in row]
                 else:
                     data.append([item.v for item in row])
                 if i >= n_rows:  # Ограничиваем для теста
