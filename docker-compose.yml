@@ -1,0 +1,55 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15
+    container_name: railway_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${DB_USER:-railway_user}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-railway_password}
+      POSTGRES_DB: ${DB_NAME:-railway_db}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF-8 --lc-collate=C --lc-ctype=C"
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d
+      - ./db/backups:/backups
+    networks:
+      - railway_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-railway_user} -d ${DB_NAME:-railway_db}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  pgadmin:
+    image: dpage/pgadmin4:7
+    container_name: railway_pgadmin
+    restart: unless-stopped
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL:-admin@railway.com}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD:-admin}
+      PGADMIN_CONFIG_SERVER_MODE: 'False'
+      
+    ports:
+      - "${PGADMIN_PORT:-5050}:80"
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+    networks:
+      - railway_network
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+    name: railway_postgres_data
+  pgadmin_data:
+    name: railway_pgadmin_data
+
+networks:
+  railway_network:
+    name: railway_network
+    driver: bridge
