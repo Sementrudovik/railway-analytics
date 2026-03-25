@@ -1,5 +1,8 @@
-CREATE TABLE IF NOT EXISTS railway_analytics (
-    id SERIAL PRIMARY KEY,
+-- db/init/03_create_staging.sql
+-- Staging таблица (сырые данные)
+
+CREATE TABLE IF NOT EXISTS railway.staging_transport (
+    id BIGSERIAL PRIMARY KEY,
     wagon_number DECIMAL(8),
     container_number VARCHAR(11),
     date_of_departure DATE,
@@ -15,3 +18,7 @@ CREATE TABLE IF NOT EXISTS railway_analytics (
     source_file VARCHAR(500),
     batch_id UUID
 );
+-- Индексы для staging
+CREATE INDEX idx_staging_departure_date ON railway.staging_transport(departure_date);
+CREATE INDEX idx_staging_batch ON railway.staging_transport(batch_id);
+

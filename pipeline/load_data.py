@@ -1,300 +1,405 @@
 # pipeline/load_data.py
-"""
-Скрипт для загрузки данных из XLSB файлов в PostgreSQL
-"""
+
 import pandas as pd
 import numpy as np
 from pathlib import Path
 import sys
-import os
 import uuid
 import logging
 from datetime import datetime
 import argparse
+from typing import List, Tuple, Iterator, Any
+import time
 
-# Добавляем корень проекта в путь
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 from db.connection import get_db_connection
-from config.columns.columns_config import COLUMNS_TO_DROP, COLUMN_MAPPING
+from config.columns.columns_config import COLUMNS_TO_KEEP, COLUMN_MAPPING
 
-# Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-# Пути
+# Конфигурация
 INPUT_DIR = Path("/Users/semenanin/Downloads")
 OUTPUT_DIR = Path("/Users/semenanin/Documents/Python/University/railway-analytics/data/processed")
 ERROR_DIR = Path("/Users/semenanin/Documents/Python/University/railway-analytics/data/errors")
+BATCH_SIZE = 50000  # Размер батча для execute_values
 
 
-def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+class StreamingLoader:
     """
-    Очистка данных перед загрузкой
+    Загрузчик данных с потоковым чтением XLSB
+    Не держит весь файл в памяти
     """
-    logger.info("Очистка данных...")
     
-    # Заменяем пустые строки на None
-    df = df.replace({pd.NA: None, np.nan: None, '': None, 'nan': None})
+    def __init__(self, batch_size: int = BATCH_SIZE):
+        self.batch_size = batch_size
+        self.stats = {
+            'total_rows': 0,
+            'total_files': 0,
+            'successful_files': 0,
+            'failed_files': 0,
+            'start_time': None,
+            'end_time': None
+        }
     
-    # Обработка даты отправления
-    if 'Дата отправления' in df.columns:
-        df['Дата отправления'] = pd.to_datetime(
-            df['Дата отправления'], 
-            errors='coerce',
-            format='%Y-%m-%d',  # подстройте под ваш формат
-            dayfirst=False
-        )
-    
-    # Очистка числовых полей
-    numeric_fields = ['Номер вагона', 'Номер контейнера', 'Код груза', 'Количество контейнеров']
-    for field in numeric_fields:
-        if field in df.columns:
-            df[field] = pd.to_numeric(df[field], errors='coerce')
-            # Заменяем NaN на None
-            df[field] = df[field].where(pd.notna(df[field]), None)
-    
-    return df
-
-
-def add_metadata_columns(df: pd.DataFrame, source_file: str, batch_id: uuid.UUID) -> pd.DataFrame:
-    """
-    Добавление метаданных в датафрейм
-    """
-    df['source_file'] = source_file
-    df['batch_id'] = str(batch_id)
-    df['loaded_at'] = datetime.now()
-    return df
-
-
-def rename_columns(df: pd.DataFrame, mapping: dict) -> pd.DataFrame:
-    """
-    Переименование колонок согласно маппингу
-    """
-    # Оставляем только те колонки, которые есть в маппинге
-    existing_columns = {k: v for k, v in mapping.items() if k in df.columns}
-    df = df.rename(columns=existing_columns)
-    
-    # Добавляем недостающие колонки с None значениями
-    for target_col in mapping.values():
-        if target_col not in df.columns:
-            df[target_col] = None
-    
-    return df
-
-
-def save_error_file(file_path: Path, error: Exception, df: pd.DataFrame = None):
-    """
-    Сохранение информации об ошибке
-    """
-    ERROR_DIR.mkdir(parents=True, exist_ok=True)
-    error_file = ERROR_DIR / f"{file_path.stem}_error.txt"
-    
-    with open(error_file, 'w', encoding='utf-8') as f:
-        f.write(f"File: {file_path.name}\n")
-        f.write(f"Error: {str(error)}\n")
-        f.write(f"Time: {datetime.now()}\n\n")
-        
-        if df is not None:
-            f.write(f"DataFrame info:\n")
-            f.write(f"Shape: {df.shape}\n")
-            f.write(f"Columns: {list(df.columns)}\n")
-            f.write(f"Sample:\n{df.head(3).to_string()}\n")
-    
-    logger.error(f"Error saved to {error_file}")
-
-
-def load_to_postgresql(df: pd.DataFrame, batch_id: uuid.UUID):
-    """
-    Загрузка данных в PostgreSQL
-    """
-    conn = get_db_connection()
-    if not conn:
-        logger.error("Не удалось подключиться к PostgreSQL")
-        return False
-    
-    try:
-        cursor = conn.cursor()
-        
-        # Подготавливаем данные для вставки
-        records = []
-        for _, row in df.iterrows():
-            # Заменяем все NaN на None
-            row_data = [None if pd.isna(x) else x for x in row]
-            records.append(row_data)
-        
-        # SQL запрос для вставки
-        insert_query = """
-            INSERT INTO railway.staging_transport (
-                wagon_number,
-                container_number,
-                departure_date,
-                cargo_code,
-                departure_country,
-                departure_region,
-                departure_station,
-                destination_country,
-                destination_region,
-                destination_station,
-                destination_station_sng,
-                number_of_containers,
-                source_file,
-                batch_id,
-                loaded_at
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    def read_xlsb_streaming(self, file_path: Path) -> Iterator[Tuple[List[str], List[Any]]]:
         """
+        Истинно потоковое чтение XLSB файла.
+        Читает строку за строкой, не загружая весь файл в память.
         
-        # Вставляем батчами по 1000 записей
-        batch_size = 1000
-        for i in range(0, len(records), batch_size):
-            batch = records[i:i + batch_size]
-            cursor.executemany(insert_query, batch)
-            conn.commit()
-            logger.info(f"Загружено {min(i + batch_size, len(records))} из {len(records)} записей")
+        Yields:
+            Tuple[headers, row_values] - заголовки и значения строки
+        """
+        from pyxlsb import open_workbook
         
-        logger.info(f"Успешно загружено {len(records)} записей в staging_transport")
-        return True
+        logger.debug(f"Открываем файл: {file_path.name}")
         
-    except Exception as e:
-        conn.rollback()
-        logger.error(f"Ошибка при загрузке в PostgreSQL: {e}")
-        return False
-    finally:
-        conn.close()
-
-
-def process_file(file_path: Path, columns_to_drop: list, mapping: dict, batch_id: uuid.UUID) -> bool:
-    """
-    Обработка одного файла
-    """
-    try:
-        logger.info(f"Начинаем обработку файла: {file_path.name}")
+        with open_workbook(file_path) as wb:
+            with wb.get_sheet(1) as sheet:
+                rows_iter = sheet.rows()
+                
+                # Читаем заголовки (первая строка)
+                headers_row = next(rows_iter)
+                headers = [item.v for item in headers_row]
+                logger.debug(f"Заголовки: {headers[:5]}...")
+                
+                # Отдаем заголовки один раз
+                headers_yielded = False
+                
+                # Читаем данные строку за строкой
+                for row in rows_iter:
+                    if not headers_yielded:
+                        yield headers, None  # Сигнал: заголовки готовы
+                        headers_yielded = True
+                    
+                    row_values = [item.v for item in row]
+                    yield None, row_values  # Сигнал: строка данных
+    
+    def read_xlsb_chunked_streaming(self, file_path: Path, chunk_size: int = 10000) -> Iterator[pd.DataFrame]:
+        """
+        Потоковое чтение XLSB файла чанками.
+        Накопляет строки в чанк и отдает DataFrame.
         
-        # Читаем файл
-        df = pd.read_excel(file_path, engine="pyxlsb")
-        logger.info(f"Прочитано строк: {len(df)}, колонок: {len(df.columns)}")
+        Args:
+            file_path: путь к файлу
+            chunk_size: количество строк в чанке
         
-        # Извлекаем дату из имени файла
-        file_name_without_ext = file_path.stem
-        date_from_filename = file_name_without_ext[-7:] if len(file_name_without_ext) >= 7 else None
+        Yields:
+            pd.DataFrame: чанк данных
+        """
+        chunk = []
+        headers = None
         
-        # Добавляем количество контейнеров
-        df["Количество контейнеров"] = 1
+        for h, row in self.read_xlsb_streaming(file_path):
+            if h is not None and headers is None:
+                headers = h
+                continue
+            
+            if row is not None:
+                chunk.append(row)
+                
+                if len(chunk) >= chunk_size:
+                    df = pd.DataFrame(chunk, columns=headers)
+                    yield df
+                    chunk = []
         
-        # Удаляем ненужные колонки
-        columns_to_drop_existing = [col for col in columns_to_drop if col in df.columns]
-        if columns_to_drop_existing:
-            df = df.drop(columns=columns_to_drop_existing)
-            logger.info(f"Удалено колонок: {len(columns_to_drop_existing)}")
+        # Отдаем остаток
+        if chunk:
+            df = pd.DataFrame(chunk, columns=headers)
+            yield df
+    
+    def extract_date_from_filename(self, filename: str) -> str:
+        """
+        Извлечение и парсинг даты из имени файла.
+        Использует pd.to_datetime с правильным форматом.
         
-        # Очистка данных
-        df = clean_dataframe(df)
+        Ожидаемый формат: ...MM.YYYY.xlsb
+        """
+        name_without_ext = Path(filename).stem
         
-        # Переименовываем колонки
-        df = rename_columns(df, mapping)
+        if len(name_without_ext) >= 7:
+            date_str = name_without_ext[-7:]
+            try:
+                # Правильный парсинг даты
+                parsed_date = pd.to_datetime(date_str, format="%m.%Y")
+                # Возвращаем в формате YYYY-MM-DD (первое число месяца)
+                return parsed_date.strftime("%Y-%m-%d")
+            except Exception as e:
+                logger.debug(f"Не удалось распарсить дату '{date_str}' из {filename}: {e}")
+        
+        return None
+    
+    def transform_row(self, row: List[Any], headers: List[str], file_name: str, 
+                      batch_id: uuid.UUID, date_from_filename: str = None) -> Tuple:
+        """
+        Трансформация одной строки в кортеж для загрузки.
+        Работает с одной строкой, не создавая DataFrame.
+        """
+        # Создаем словарь из строки
+        row_dict = dict(zip(headers, row))
+        
+        # Собираем значения в порядке COLUMN_MAPPING
+        result = []
+        
+        for source_col, target_col in COLUMN_MAPPING.items():
+            value = row_dict.get(source_col)
+            
+            # Обработка даты отправления
+            if target_col == 'departure_date':
+                if value is None and date_from_filename:
+                    value = date_from_filename
+                elif value is not None:
+                    try:
+                        # Парсим дату если это строка
+                        if isinstance(value, str):
+                            value = pd.to_datetime(value, errors='coerce')
+                            if pd.notna(value):
+                                value = value.strftime("%Y-%m-%d")
+                    except:
+                        value = None
+            
+            # Очистка NaN
+            if pd.isna(value) or (isinstance(value, float) and np.isnan(value)):
+                value = None
+            
+            result.append(value)
+        
+        # Добавляем number_of_containers
+        result.append(1)  # number_of_containers
         
         # Добавляем метаданные
-        df = add_metadata_columns(df, file_path.name, batch_id)
+        result.append(file_name)  # source_file
+        result.append(str(batch_id))  # batch_id
+        result.append(datetime.now())  # loaded_at
         
-        # Загружаем в PostgreSQL
-        success = load_to_postgresql(df, batch_id)
+        return tuple(result)
+    
+    def bulk_insert(self, records: List[Tuple], table_name: str) -> bool:
+        """
+        Массовая вставка через execute_values
+        """
+        if not records:
+            return True
         
-        if success:
-            # Сохраняем CSV копию
-            OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-            output_path = OUTPUT_DIR / f"{file_path.stem}_processed.csv"
-            df.to_csv(output_path, index=False, encoding='utf-8-sig')
-            logger.info(f"Сохранена CSV копия: {output_path}")
+        from psycopg2.extras import execute_values
         
-        logger.info(f"Файл {file_path.name} обработан успешно")
-        return True
+        conn = get_db_connection()
+        if not conn:
+            logger.error("Нет подключения к БД")
+            return False
         
-    except Exception as e:
-        logger.error(f"Ошибка при обработке файла {file_path.name}: {e}")
-        save_error_file(file_path, e)
-        return False
-
-
-def process_files(
-    input_dir: Path, 
-    columns_to_drop: list, 
-    mapping: dict,
-    limit: int = None
-):
-    """
-    Обработка всех файлов в директории
-    """
-    # Проверяем существование директории
-    if not input_dir.exists():
-        logger.error(f"Директория {input_dir} не существует")
-        return
+        try:
+            cursor = conn.cursor()
+            
+            insert_query = f"""
+                INSERT INTO {table_name} (
+                    container_number,
+                    departure_date,
+                    cargo_code,
+                    departure_country,
+                    departure_region,
+                    departure_station,
+                    destination_country,
+                    destination_region,
+                    destination_station,
+                    destination_station_sng,
+                    number_of_containers,
+                    source_file,
+                    batch_id,
+                    loaded_at
+                ) VALUES %s
+            """
+            
+            execute_values(
+                cursor,
+                insert_query,
+                records,
+                page_size=10000
+            )
+            
+            conn.commit()
+            logger.debug(f"Вставлено {len(records)} записей")
+            return True
+            
+        except Exception as e:
+            conn.rollback()
+            logger.error(f"Ошибка вставки: {e}")
+            return False
+        finally:
+            conn.close()
     
-    # Получаем список файлов
-    xlsb_files = list(input_dir.glob("*.xlsb"))
-    if not xlsb_files:
-        logger.warning(f"Не найдено XLSB файлов в {input_dir}")
-        return
+    def process_file(self, file_path: Path, batch_id: uuid.UUID) -> bool:
+        """
+        Обработка одного файла с потоковым чтением
+        """
+        file_start_time = time.time()
+        logger.info(f"Обработка файла: {file_path.name}")
+        
+        try:
+            # Извлекаем дату из имени файла
+            date_from_filename = self.extract_date_from_filename(file_path.name)
+            if date_from_filename:
+                logger.info(f"Дата из имени файла: {date_from_filename}")
+            
+            records_buffer = []
+            total_rows = 0
+            headers = None
+            
+            # Потоковое чтение строк
+            for h, row in self.read_xlsb_streaming(file_path):
+                # Получаем заголовки
+                if h is not None and headers is None:
+                    headers = h
+                    logger.debug(f"Заголовки получены: {len(headers)} колонок")
+                    continue
+                
+                # Обрабатываем строку данных
+                if row is not None and headers:
+                    # Проверяем, есть ли нужные колонки
+                    needed_cols = [col for col in COLUMNS_TO_KEEP if col in headers]
+                    if not needed_cols:
+                        logger.warning(f"Нет нужных колонок в файле")
+                        return False
+                    
+                    # Трансформируем строку
+                    record = self.transform_row(
+                        row, headers, file_path.name, batch_id, date_from_filename
+                    )
+                    records_buffer.append(record)
+                    total_rows += 1
+                    
+                    # Вставляем батч
+                    if len(records_buffer) >= self.batch_size:
+                        logger.info(f"Вставка батча {len(records_buffer)} записей")
+                        if not self.bulk_insert(records_buffer, "railway.staging_transport"):
+                            return False
+                        records_buffer = []
+            
+            # Вставляем остатки
+            if records_buffer:
+                logger.info(f"Вставка остатка {len(records_buffer)} записей")
+                if not self.bulk_insert(records_buffer, "railway.staging_transport"):
+                    return False
+            
+            file_elapsed = time.time() - file_start_time
+            throughput = total_rows / file_elapsed if file_elapsed > 0 else 0
+            
+            logger.info(
+                f"Файл {file_path.name}: {total_rows} строк, "
+                f"время: {file_elapsed:.2f} сек, "
+                f"скорость: {throughput:.0f} rows/sec"
+            )
+            
+            # Обновляем статистику
+            self.stats['total_rows'] += total_rows
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Ошибка обработки {file_path.name}: {e}", exc_info=True)
+            
+            # Сохраняем ошибку
+            ERROR_DIR.mkdir(parents=True, exist_ok=True)
+            error_file = ERROR_DIR / f"{file_path.stem}_error.txt"
+            with open(error_file, 'w') as f:
+                f.write(f"File: {file_path.name}\n")
+                f.write(f"Error: {e}\n")
+                f.write(f"Time: {datetime.now()}\n")
+            
+            return False
     
-    logger.info(f"Найдено файлов: {len(xlsb_files)}")
+    def process_all_files(self, input_dir: Path, limit: int = None):
+        """
+        Обработка всех файлов в директории
+        """
+        if not input_dir.exists():
+            logger.error(f"Директория {input_dir} не существует")
+            return
+        
+        files = sorted(list(input_dir.glob("*.xlsb")))
+        if not files:
+            logger.warning("XLSB файлы не найдены")
+            return
+        
+        if limit:
+            files = files[:limit]
+        
+        logger.info("=" * 60)
+        logger.info(f"Найдено файлов: {len(files)}")
+        logger.info(f"Размер батча: {self.batch_size} записей")
+        logger.info("Режим: потоковое чтение (True streaming)")
+        logger.info("=" * 60)
+        
+        global_batch_id = uuid.uuid4()
+        logger.info(f"Global Batch ID: {global_batch_id}")
+        
+        self.stats['start_time'] = time.time()
+        self.stats['total_files'] = len(files)
+        
+        for file_path in files:
+            if self.process_file(file_path, global_batch_id):
+                self.stats['successful_files'] += 1
+            else:
+                self.stats['failed_files'] += 1
+        
+        self.stats['end_time'] = time.time()
+        self._print_summary()
     
-    # Ограничиваем количество файлов для теста
-    if limit:
-        xlsb_files = xlsb_files[:limit]
-        logger.info(f"Обрабатываем только {limit} файлов")
-    
-    # Создаем общий batch_id для всей загрузки
-    global_batch_id = uuid.uuid4()
-    logger.info(f"Batch ID: {global_batch_id}")
-    
-    # Статистика
-    successful = 0
-    failed = 0
-    
-    for file_path in xlsb_files:
-        success = process_file(file_path, columns_to_drop, mapping, global_batch_id)
-        if success:
-            successful += 1
-        else:
-            failed += 1
-    
-    logger.info(f"\n=== Статистика загрузки ===")
-    logger.info(f"Успешно: {successful}")
-    logger.info(f"Ошибок: {failed}")
-    logger.info(f"Всего: {successful + failed}")
+    def _print_summary(self):
+        """
+        Вывод статистики загрузки
+        """
+        elapsed = self.stats['end_time'] - self.stats['start_time']
+        
+        print("\n" + "=" * 60)
+        print("СТАТИСТИКА ЗАГРУЗКИ")
+        print("=" * 60)
+        print(f"Всего файлов: {self.stats['total_files']}")
+        print(f"Успешно: {self.stats['successful_files']}")
+        print(f"Ошибок: {self.stats['failed_files']}")
+        print(f"Всего строк: {self.stats['total_rows']:,}")
+        print(f"Общее время: {elapsed:.2f} сек")
+        print(f"Средняя скорость: {self.stats['total_rows']/elapsed:.0f} rows/sec")
+        print("=" * 60)
 
 
 def main():
     """
     Основная функция
     """
-    parser = argparse.ArgumentParser(description='Загрузка XLSB данных в PostgreSQL')
-    parser.add_argument('--limit', type=int, help='Ограничить количество файлов для обработки')
+    parser = argparse.ArgumentParser(
+        description='Потоковая загрузка XLSB в PostgreSQL (True streaming)'
+    )
+    parser.add_argument('--limit', type=int, help='Ограничить количество файлов')
+    parser.add_argument('--batch-size', type=int, default=BATCH_SIZE, 
+                       help=f'Размер батча (default: {BATCH_SIZE})')
     parser.add_argument('--input-dir', type=str, help='Директория с исходными файлами')
-    parser.add_argument('--output-dir', type=str, help='Директория для сохранения CSV')
     
     args = parser.parse_args()
     
     # Определяем директории
     input_dir = Path(args.input_dir) if args.input_dir else INPUT_DIR
-    output_dir = Path(args.output_dir) if args.output_dir else OUTPUT_DIR
     
-    logger.info(f"Начало загрузки данных")
+    # Создаем директории
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    ERROR_DIR.mkdir(parents=True, exist_ok=True)
+    
+    logger.info("=" * 60)
+    logger.info("ЗАПУСК ПОТОКОВОЙ ЗАГРУЗКИ XLSB")
+    logger.info("=" * 60)
     logger.info(f"Входная директория: {input_dir}")
-    logger.info(f"Выходная директория: {output_dir}")
+    logger.info(f"Размер батча: {args.batch_size or BATCH_SIZE}")
+    logger.info("Потоковое чтение: ВКЛЮЧЕНО (строки не накапливаются в памяти)")
     
-    # Запускаем обработку
-    process_files(
-        input_dir=input_dir,
-        columns_to_drop=COLUMNS_TO_DROP,
-        mapping=COLUMN_MAPPING,
-        limit=args.limit
-    )
+    loader = StreamingLoader(batch_size=args.batch_size or BATCH_SIZE)
+    loader.process_all_files(input_dir, args.limit)
     
-    logger.info("Загрузка данных завершена")
+    logger.info("Загрузка завершена")
 
 
 if __name__ == "__main__":
