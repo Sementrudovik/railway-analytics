@@ -198,6 +198,7 @@ class StreamingLoader:
             
             insert_query = f"""
                 INSERT INTO {table_name} (
+                    wagon_number,
                     container_number,
                     departure_date,
                     cargo_code,

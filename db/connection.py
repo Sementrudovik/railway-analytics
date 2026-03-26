@@ -23,3 +23,7 @@ def get_db_connection():
     except Exception as e:
         logger.error(f"Ошибка подключения: {e}")
         return None
+def return_db_connection(conn):
+    """Закрыть соединение"""
+    if conn:
+        conn.close()
