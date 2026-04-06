@@ -1,5 +1,9 @@
 # pipeline/load_data.py
 
+
+## дата отправки не тот формат
+
+
 import pandas as pd
 import numpy as np
 from pathlib import Path
@@ -24,7 +28,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Конфигурация
-INPUT_DIR = Path("/Users/semenanin/Downloads")
+INPUT_DIR = Path("/Users/semenanin/Documents/Python/University/railway-analytics/data/raw/test")
 OUTPUT_DIR = Path("/Users/semenanin/Documents/Python/University/railway-analytics/data/processed")
 ERROR_DIR = Path("/Users/semenanin/Documents/Python/University/railway-analytics/data/errors")
 BATCH_SIZE = 50000  # Размер батча для execute_values
