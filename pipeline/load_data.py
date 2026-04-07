@@ -2,7 +2,7 @@
 
 
 ## дата отправки не тот формат
-
+    
 
 import pandas as pd
 import numpy as np
@@ -139,7 +139,7 @@ class StreamingLoader:
         return None
     
     def transform_row(self, row: List[Any], headers: List[str], file_name: str, 
-                      batch_id: uuid.UUID, date_from_filename: str = None) -> Tuple:
+                        batch_id: uuid.UUID, date_from_filename: str = None) -> Tuple:
         """
         Трансформация одной строки в кортеж для загрузки.
         Работает с одной строкой, не создавая DataFrame.
@@ -155,21 +155,12 @@ class StreamingLoader:
             
             # Обработка даты отправления
             if target_col == 'departure_date':
-                if value is None and date_from_filename:
-                    value = date_from_filename
-                elif value is not None:
-                    try:
-                        # Парсим дату если это строка
-                        if isinstance(value, str):
-                            value = pd.to_datetime(value, errors='coerce')
-                            if pd.notna(value):
-                                value = value.strftime("%Y-%m-%d")
-                    except:
-                        value = None
+                value = self._normalize_date(value, date_from_filename)
             
-            # Очистка NaN
-            if pd.isna(value) or (isinstance(value, float) and np.isnan(value)):
-                value = None
+            # Очистка NaN (только для не-date полей, так как date уже обработан)
+            if target_col != 'departure_date':
+                if pd.isna(value) or (isinstance(value, float) and np.isnan(value)):
+                    value = None
             
             result.append(value)
         
@@ -182,6 +173,75 @@ class StreamingLoader:
         result.append(datetime.now())  # loaded_at
         
         return tuple(result)
+
+    def _normalize_date(self, value: Any, date_from_filename: str = None) -> str:
+        """
+        Нормализация даты в формат YYYY-MM-DD
+        
+        Args:
+            value: значение из Excel (может быть datetime, строка, число)
+            date_from_filename: дата из имени файла (как fallback)
+        
+        Returns:
+            str: дата в формате YYYY-MM-DD или None
+        """
+        # Если значение None или пустое - используем дату из имени файла
+        if value is None or (isinstance(value, str) and value.strip() == ''):
+            return date_from_filename
+        
+        try:
+            # Случай 1: значение уже datetime объект
+            if isinstance(value, (datetime, pd.Timestamp)):
+                return value.strftime("%Y-%m-%d")
+            
+            # Случай 2: значение - число (Excel серийный номер даты)
+            if isinstance(value, (int, float)):
+                # Excel: 1 Jan 1900 = 1
+                try:
+                    excel_date = pd.to_datetime(value, unit='D', origin='1899-12-30')
+                    return excel_date.strftime("%Y-%m-%d")
+                except:
+                    pass
+            
+            # Случай 3: значение - строка
+            if isinstance(value, str):
+                # Пробуем разные форматы
+                formats = [
+                    "%d.%m.%Y",      # 31.12.2024
+                    "%d/%m/%Y",      # 31/12/2024
+                    "%Y-%m-%d",      # 2024-12-31
+                    "%d.%m.%y",      # 31.12.24
+                    "%d/%m/%y",      # 31/12/24
+                    "%m/%d/%Y",      # 12/31/2024 (US)
+                    "%Y%m%d",        # 20241231
+                ]
+                
+                for fmt in formats:
+                    try:
+                        parsed = datetime.strptime(value.strip(), fmt)
+                        return parsed.strftime("%Y-%m-%d")
+                    except ValueError:
+                        continue
+                
+                # Попытка через pandas (может распознать больше форматов)
+                try:
+                    parsed = pd.to_datetime(value, errors='coerce')
+                    if pd.notna(parsed):
+                        return parsed.strftime("%Y-%m-%d")
+                except:
+                    pass
+            
+            # Если ничего не помогло - fallback на дату из имени файла
+            if date_from_filename:
+                logger.warning(f"Не удалось распарсить дату '{value}', использую дату из имени файла: {date_from_filename}")
+                return date_from_filename
+            
+            logger.warning(f"Не удалось распарсить дату '{value}'")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Ошибка парсинга даты '{value}': {e}")
+            return date_from_filename if date_from_filename else None
     
     def bulk_insert(self, records: List[Tuple], table_name: str) -> bool:
         """
