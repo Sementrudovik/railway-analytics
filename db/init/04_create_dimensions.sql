@@ -24,4 +24,4 @@ CREATE TABLE IF NOT EXISTS railway.dim_station (
 CREATE TABLE IF NOT EXISTS railway.dim_cargo (
     cargo_id SERIAL PRIMARY KEY,
     cargo_code VARCHAR(50) UNIQUE NOT NULL
-);
+);  

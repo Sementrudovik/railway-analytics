@@ -1,7 +1,8 @@
 # Виртуальное окружение
 venv/
+env.vps/
 .env/
-.venv/
+.venv/  
 ENV/
 env/
 
